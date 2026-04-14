@@ -20,6 +20,24 @@ def to_float(x):
     except ValueError:
         return 0.0
 
+
+def clean_cell(text, is_description=False):
+    """Strip \n (and \r) from ALL cell values before processing.
+    
+    - Dates and large numbers: remove \n entirely (concatenates broken text like "01\n/01\n/2025" → "01/01/2025" or "1,234\n.56" → "1,234.56").
+    - Descriptions: replace \n with space (preserves readability for wrapped lines).
+    This fixes the original limitation where only descriptions were (partially) cleaned.
+    """
+    if text is None:
+        return ""
+    text_str = str(text)
+    if is_description:
+        cleaned = text_str.replace('\n', ' ').replace('\r', ' ')
+    else:
+        cleaned = text_str.replace('\n', '').replace('\r', '')
+    return cleaned.strip()
+
+
 # ==========================================
 # 2. GCB BANK PROCESSING LOGIC
 # ==========================================
@@ -59,8 +77,12 @@ def process_gcb_files(uploaded_files):
                     row_amounts = [] 
 
                     for w in row_words:
-                        text = w["text"]
+                        raw_text = w.get("text", "")
                         x = w["x0"]
+
+                        # NEW FIX: clean \n from ALL cells before any processing
+                        is_desc_zone = x >= DESC_START_X
+                        text = clean_cell(raw_text, is_description=is_desc_zone)
 
                         # 1. Capture Date
                         if x < DATE_MAX_X:
@@ -177,7 +199,12 @@ def process_stanbic_files(uploaded_files):
                     if not header_found: continue
 
                     for row in table[start_row:]:
-                        row = ['' if x is None else str(x).strip() for x in row]
+                        if not row: continue
+                        
+                        # NEW FIX: strip \n from ALL cells before processing
+                        # (dates/large numbers get \n removed; descriptions get \n → space)
+                        row = [clean_cell(x, is_description=(idx == 2)) for idx, x in enumerate(row)]
+                        
                         if len(row) < 6: continue
                         
                         date_val = row[1]

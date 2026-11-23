@@ -234,7 +234,254 @@ def process_stanbic_files(uploaded_files):
 
 
 # ==========================================
-# 4. STREAMLIT APP UI
+# 4. NEW BANKS: FIRST ATLANTIC, OMNIBSIC, FNB, CALBANK, CBG
+# ==========================================
+
+DATE_FORMATS = ["%d-%b-%Y", "%d %b %Y", "%d %b %y", "%d/%m/%Y", "%d-%m-%Y", "%d/%m/%y"]
+
+
+def parse_date(text):
+    """Turn a bank's date string into a datetime (None if it can't be read)."""
+    s = re.sub(r"\s+", " ", str(text or "")).strip().title()
+    s = s.replace("- ", "-")
+    for fmt in DATE_FORMATS:
+        try:
+            return pd.to_datetime(s, format=fmt)
+        except (ValueError, TypeError):
+            continue
+    return None
+
+
+def _norm(text):
+    return re.sub(r"[^a-z]", "", str(text or "").lower())
+
+
+def _find_header(table, header_map):
+    """Locate the header row in a pdfplumber table and map canonical field -> column index."""
+    for i, row in enumerate(table[:5]):
+        cells = [_norm(c) for c in row]
+        mapping = {}
+        for field, aliases in header_map.items():
+            for j, c in enumerate(cells):
+                if c in aliases:
+                    mapping[field] = j
+                    break
+        if "date" in mapping and "desc" in mapping and "balance" in mapping:
+            return i, mapping
+    return None, None
+
+
+def parse_table_statement(uploaded_files, header_map, newest_first=False):
+    """Generic table-based parser for statements with Date / Narration / Debit / Credit / Balance.
+
+    header_map: canonical field -> set of normalised header labels.
+      Fields: post_date (optional), date (value date), desc, debit, credit, balance.
+    Rows without a readable date are treated as wrapped text and appended to the previous
+    transaction (this also repairs dates split across a page break, e.g. '20-Oct-' / '2026').
+    """
+    all_records = []
+    for file in uploaded_files:
+        file_records = []
+        with pdfplumber.open(file) as pdf:
+            mapping = None
+            for page in pdf.pages:
+                for table in page.extract_tables():
+                    if not table:
+                        continue
+                    hdr_idx, found = _find_header(table, header_map)
+                    if found:
+                        mapping, start = found, hdr_idx + 1
+                    elif mapping and len(table[0]) > max(mapping.values()):
+                        start = 0  # continuation table without repeated header
+                    else:
+                        continue
+
+                    for row in table[start:]:
+                        if not row:
+                            continue
+                        get = lambda f, desc=False: clean_cell(row[mapping[f]], is_description=desc) \
+                            if f in mapping and mapping[f] < len(row) else ""
+                        date_txt = get("date")
+                        post_txt = get("post_date")
+                        desc_txt = get("desc", desc=True)
+                        if _norm(row[0]) == "total" or _norm(date_txt) == "total":
+                            continue
+                        key_date = post_txt or date_txt
+
+                        if not get("balance") or not key_date:
+                            # wrapped line / page-split row -> extend previous transaction
+                            if file_records:
+                                last = file_records[-1]
+                                if parse_date(last["_date_raw"]) is None and date_txt:
+                                    last["_date_raw"] += date_txt
+                                if parse_date(last["_post_raw"]) is None and post_txt:
+                                    last["_post_raw"] += post_txt
+                                if desc_txt:
+                                    last["Description"] += " " + desc_txt
+                            continue
+
+                        debit = to_float(get("debit"))
+                        credit = to_float(get("credit"))
+                        file_records.append({
+                            "_post_raw": post_txt or date_txt,
+                            "_date_raw": date_txt,
+                            "Description": desc_txt,
+                            "Debit": debit if debit else None,
+                            "Credit": credit if credit else None,
+                            "Balance": to_float(get("balance")),
+                        })
+
+        if newest_first:
+            file_records.reverse()
+        all_records.extend(file_records)
+
+    return _finalise(all_records, has_post="post_date" in header_map)
+
+
+def _finalise(records, has_post):
+    """Convert date strings to real dates, keep chronological order, tidy columns."""
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    df["Value Date"] = df["_date_raw"].map(parse_date)
+    if has_post:
+        df["Posting Date"] = df["_post_raw"].map(parse_date)
+        df = df.sort_values("Posting Date", kind="mergesort")
+    else:
+        df = df.sort_values("Value Date", kind="mergesort")
+    for c in ["Value Date", "Posting Date"]:
+        if c in df.columns:
+            df[c] = df[c].dt.date
+    df["Description"] = df["Description"].str.replace(r"\s+", " ", regex=True).str.strip()
+    return df.drop(columns=[c for c in ["_date_raw", "_post_raw"] if c in df.columns]).reset_index(drop=True)
+
+
+FIRST_ATLANTIC_HEADERS = {
+    "post_date": {"postdate"}, "date": {"valuedate"}, "desc": {"narration"},
+    "debit": {"debit"}, "credit": {"credit"}, "balance": {"balance"},
+}
+OMNIBSIC_HEADERS = {
+    "post_date": {"transactiondate"}, "date": {"valuedate"}, "desc": {"description"},
+    "debit": {"debitamount"}, "credit": {"creditamount"}, "balance": {"balance"},
+}
+CALBANK_HEADERS = {
+    "post_date": {"bookingdate"}, "date": {"valuedate"}, "desc": {"narration"},
+    "debit": {"debitamount"}, "credit": {"creditamount"}, "balance": {"balance"},
+}
+CBG_HEADERS = {
+    "post_date": {"bookingdate"}, "date": {"valuedate"}, "desc": {"description"},
+    "debit": {"debit"}, "credit": {"credit"}, "balance": {"closing", "closingbalance"},
+}
+
+
+def process_first_atlantic_files(files):
+    return parse_table_statement(files, FIRST_ATLANTIC_HEADERS)
+
+
+def process_omnibsic_files(files):
+    return parse_table_statement(files, OMNIBSIC_HEADERS, newest_first=True)
+
+
+def process_calbank_files(files):
+    return parse_table_statement(files, CALBANK_HEADERS)
+
+
+def process_cbg_files(files):
+    return parse_table_statement(files, CBG_HEADERS)
+
+
+def process_fnb_files(uploaded_files):
+    """First National Bank 'Transactions history statement'.
+
+    The PDF has no ruled table and no running balance, so words are bucketed into columns
+    using the x-positions of the header on each page (Book date | Value date | Reference |
+    Description | Debit | Credit). Statement is newest-first.
+    """
+    date_re = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+    all_records = []
+    for file in uploaded_files:
+        file_records = []
+        with pdfplumber.open(file) as pdf:
+            cols = None
+            for page in pdf.pages:
+                words = page.extract_words()
+                lines = {}
+                for w in words:
+                    lines.setdefault(round(w["top"]), []).append(w)
+                for y in sorted(lines):
+                    line = sorted(lines[y], key=lambda w: w["x0"])
+                    texts = [w["text"] for w in line]
+                    joined = " ".join(texts)
+
+                    if "Reference" in texts and "Description" in texts and "Debit" in texts:
+                        pos = {w["text"]: w["x0"] for w in line}
+                        cols = {
+                            "value": pos.get("Value", line[0]["x0"] + 60) - 2,
+                            "ref": pos["Reference"] - 2,
+                            "desc": pos["Description"] - 2,
+                            "debit": pos["Debit"] - 2,
+                            "credit": pos.get("Credit", pos["Debit"] + 60) - 2,
+                        }
+                        continue
+                    if cols is None or re.match(r"^Page \d+ of \d+$", joined):
+                        continue
+
+                    book, value, desc, debit, credit = [], [], [], [], []
+                    for w in line:
+                        x = w["x0"]
+                        if x < cols["value"]:
+                            book.append(w["text"])
+                        elif x < cols["ref"]:
+                            value.append(w["text"])
+                        elif x < cols["desc"]:
+                            continue  # reference column (dropped, like the other banks)
+                        elif x < cols["debit"]:
+                            desc.append(w["text"])
+                        elif x < cols["credit"]:
+                            debit.append(w["text"])
+                        else:
+                            credit.append(w["text"])
+
+                    book_txt = "".join(book)
+                    if date_re.match(book_txt):
+                        d = to_float("".join(debit))
+                        c = to_float("".join(credit))
+                        file_records.append({
+                            "_post_raw": book_txt,
+                            "_date_raw": "".join(value) or book_txt,
+                            "Description": " ".join(desc),
+                            "Debit": abs(d) if d else None,
+                            "Credit": abs(c) if c else None,
+                        })
+                    elif file_records and desc and not book and not debit and not credit:
+                        file_records[-1]["Description"] += " " + " ".join(desc)
+        file_records.reverse()
+        all_records.extend(file_records)
+    df = _finalise(all_records, has_post=True)
+    if not df.empty:
+        df["Balance"] = None  # FNB transaction history carries no running balance
+    return df
+
+
+def reconcile(df):
+    """Check every running balance against previous balance + credit - debit."""
+    if df.empty or "Balance" not in df.columns or df["Balance"].isna().all():
+        return None
+    cr = pd.to_numeric(df["Credit"], errors="coerce").fillna(0)
+    dr = pd.to_numeric(df["Debit"], errors="coerce").fillna(0)
+    bal = pd.to_numeric(df["Balance"], errors="coerce")
+    expected = bal.shift(1) + cr - dr
+    bad = ((expected - bal).abs() > 0.01) & expected.notna()
+    opening = bal.iloc[0] - cr.iloc[0] + dr.iloc[0]
+    return {
+        "opening": opening, "closing": bal.iloc[-1],
+        "credits": cr.sum(), "debits": dr.sum(), "breaks": int(bad.sum()),
+        "break_rows": df.index[bad].tolist(),
+    }
+
+
+# ==========================================
+# 5. STREAMLIT APP UI
 # ==========================================
 
 st.set_page_config(page_title="Bank Statement Converter", layout="centered")
@@ -243,7 +490,19 @@ st.title("📂 Bank Statement to Excel")
 st.markdown("Upload multiple PDF statements and convert them into a single, clean Excel file.")
 
 # 1. Select Bank
-bank_choice = st.selectbox("Select Your Bank", ["GCB Bank", "Stanbic Bank"])
+BANKS = {
+    "GCB Bank": process_gcb_files,
+    "Stanbic Bank": process_stanbic_files,
+    "First Atlantic Bank": process_first_atlantic_files,
+    "OmniBSIC Bank": process_omnibsic_files,
+    "First National Bank (FNB)": process_fnb_files,
+    "CalBank": process_calbank_files,
+    "Consolidated Bank Ghana (CBG)": process_cbg_files,
+}
+# GCB and Stanbic parsers return newest-first; the newer parsers already return oldest-first.
+LEGACY_NEWEST_FIRST = {"GCB Bank", "Stanbic Bank"}
+
+bank_choice = st.selectbox("Select Your Bank", list(BANKS.keys()))
 
 # 2. Upload Files
 uploaded_files = st.file_uploader(
@@ -258,29 +517,45 @@ if uploaded_files:
     if st.button("Convert to Excel"):
         with st.spinner(f"Processing {len(uploaded_files)} files for {bank_choice}..."):
             try:
-                # Process based on selection
-                if bank_choice == "GCB Bank":
-                    df = process_gcb_files(uploaded_files)
-                else:
-                    df = process_stanbic_files(uploaded_files)
+                df = BANKS[bank_choice](uploaded_files)
 
                 if not df.empty:
+                    # Reverse Order (Oldest on Top) for parsers that read newest-first
+                    if bank_choice in LEGACY_NEWEST_FIRST:
+                        df = df.iloc[::-1].reset_index(drop=True)
+
+                    check = None if bank_choice in LEGACY_NEWEST_FIRST else reconcile(df)
+
                     # Final Cleanup
                     df['Credit'] = df['Credit'].fillna('')
                     df['Debit'] = df['Debit'].fillna('')
                     df['Description'] = df['Description'].str.strip()
-                    
+                    if 'Balance' in df.columns and df['Balance'].isna().all():
+                        df = df.drop(columns=['Balance'])
+
                     # Ensure Columns Order
-                    cols = ['Value Date', 'Description', 'Credit', 'Debit', 'Balance']
-                    # Only keep columns that actually exist (Stanbic/GCB might differ slightly internally)
+                    cols = ['Posting Date', 'Value Date', 'Description', 'Credit', 'Debit', 'Balance']
                     final_cols = [c for c in cols if c in df.columns]
                     df = df[final_cols]
 
-                    # Reverse Order (Oldest on Top) - As requested previously
-                    df = df.iloc[::-1]
-
                     # Show Preview
-                    st.success("✅ Conversion Successful!")
+                    st.success(f"✅ Conversion Successful! {len(df)} transactions extracted.")
+                    if check:
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Opening", f"{check['opening']:,.2f}")
+                        c2.metric("Total Credits", f"{check['credits']:,.2f}")
+                        c3.metric("Total Debits", f"{check['debits']:,.2f}")
+                        c4.metric("Closing", f"{check['closing']:,.2f}")
+                        if check['breaks'] == 0:
+                            st.caption("✔ Every running balance agrees with the previous balance ± the transaction.")
+                        else:
+                            st.warning(f"⚠️ {check['breaks']} row(s) where the running balance doesn't follow "
+                                       f"from the previous one — check rows {check['break_rows'][:10]}.")
+                    elif bank_choice.startswith("First National"):
+                        cr = pd.to_numeric(df['Credit'], errors='coerce').sum()
+                        dr = pd.to_numeric(df['Debit'], errors='coerce').sum()
+                        st.caption(f"FNB statements carry no running balance. Total credits {cr:,.2f} · "
+                                   f"total debits {dr:,.2f}.")
                     st.dataframe(df.head(5))
 
                     # Download Button
@@ -289,7 +564,8 @@ if uploaded_files:
                         df.to_excel(writer, index=False, sheet_name='Sheet1')
                     output.seek(0)
 
-                    file_name = f"{bank_choice.replace(' ', '_')}_Statement_Combined.xlsx"
+                    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", bank_choice).strip("_")
+                    file_name = f"{safe_name}_Statement_Combined.xlsx"
                     
                     st.download_button(
                         label="📥 Download Excel File",
@@ -298,7 +574,7 @@ if uploaded_files:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
                 else:
-                    st.warning("⚠️ No transactions found. Please check if the PDFs are correct.")
+                    st.warning("⚠️ No transactions found. Please check if the PDFs are correct and the right bank is selected.")
 
             except Exception as e:
                 st.error(f"❌ An error occurred: {e}")

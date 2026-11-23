@@ -78,6 +78,8 @@ def make_session_factory(url=None):
     kwargs = {"pool_pre_ping": True}
     if url.startswith("sqlite"):
         kwargs["connect_args"] = {"check_same_thread": False}
+    else:
+        kwargs["connect_args"] = {"connect_timeout": 15}
     engine = create_engine(url, **kwargs)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False), url.startswith("sqlite")
@@ -92,7 +94,7 @@ def ensure_admin(Session, username, password):
         if u is None:
             u = User(username=username, password_hash=hash_password(password))
             s.add(u)
-        elif not verify_password(password, u.password_hash):
+        elif not verify_password(password, u.password_hash):  # admin password changed in settings
             u.password_hash = hash_password(password)
         u.is_admin, u.approved = True, True
         u.approved_at = u.approved_at or _now()

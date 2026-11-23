@@ -17,11 +17,23 @@ st.set_page_config(page_title="Bank Statement Converter", layout="centered")
 # ==========================================
 # CONFIG (environment variables on Render, st.secrets on Streamlit Cloud)
 # ==========================================
+def _clean(value):
+    """Undo common paste mistakes: surrounding quotes, whitespace, Neon's `psql '...'` wrapper."""
+    if value is None:
+        return None
+    v = str(value).strip()
+    if v.lower().startswith("psql "):
+        v = v[5:].strip()
+    while len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        v = v[1:-1].strip()
+    return v or None
+
+
 def setting(name, default=None):
     if os.environ.get(name):
-        return os.environ[name]
+        return _clean(os.environ[name])
     try:
-        return st.secrets.get(name, default)
+        return _clean(st.secrets.get(name, default))
     except Exception:
         return default
 
@@ -36,7 +48,17 @@ def get_store():
     return Session, is_sqlite, bool(admin_user and admin_pass)
 
 
-Session, USING_SQLITE, ADMIN_CONFIGURED = get_store()
+try:
+    Session, USING_SQLITE, ADMIN_CONFIGURED = get_store()
+except Exception as exc:
+    st.title("📂 Bank Statement to Excel")
+    st.error("The app couldn't connect to its database, so it can't start.")
+    reason = str(exc).splitlines()[0]
+    reason = re.sub(r"://[^@\s]+@", "://***@", reason)  # never show the DB password
+    st.code(f"{type(exc).__name__}: {reason}", language=None)
+    st.caption("Check DATABASE_URL in the app settings: it should be the plain "
+               "postgresql://… string from Neon, with no quotes or 'psql' in front.")
+    st.stop()
 
 BANKS = {
     "GCB Bank": process_gcb_files,

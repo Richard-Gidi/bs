@@ -70,8 +70,11 @@ def verify_password(password, stored):
 # ---------- engine ----------
 def make_session_factory(url=None):
     url = url or os.environ.get("DATABASE_URL") or "sqlite:///bs_local.db"
-    if url.startswith("postgres://"):  # Render/Heroku style
-        url = "postgresql://" + url[len("postgres://"):]
+    # Always use the psycopg (v3) driver, whatever scheme the provider's URL uses
+    for prefix in ("postgres://", "postgresql://", "postgresql+psycopg2://"):
+        if url.startswith(prefix):
+            url = "postgresql+psycopg://" + url[len(prefix):]
+            break
     kwargs = {"pool_pre_ping": True}
     if url.startswith("sqlite"):
         kwargs["connect_args"] = {"check_same_thread": False}

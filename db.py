@@ -123,6 +123,16 @@ def authenticate(Session, username, password):
     return u, ""
 
 
+def set_password(Session, user_id, password):
+    with Session() as s:
+        u = s.get(User, user_id)
+        if u:
+            u.password_hash = hash_password(password)
+            s.commit()
+            return True
+    return False
+
+
 def pending_users(Session):
     with Session() as s:
         return list(s.scalars(select(User).where(User.approved.is_(False)).order_by(User.created_at)))

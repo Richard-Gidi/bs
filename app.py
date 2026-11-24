@@ -1,3 +1,4 @@
+import hmac
 import io
 import os
 import re
@@ -131,6 +132,12 @@ def login_screen():
                     st.error(f"Too many failed attempts. Try again in "
                              f"{int(locked_until - time.time())} seconds.")
                 else:
+                    # The admin password configured on THIS host always works; re-sync it into the
+                    # shared database first (another host may have written a different one).
+                    adm_u, adm_p = setting("ADMIN_USERNAME"), setting("ADMIN_PASSWORD")
+                    if (adm_u and adm_p and username.strip().lower() == adm_u.strip().lower()
+                            and hmac.compare_digest(password.encode(), adm_p.encode())):
+                        db.ensure_admin(Session, adm_u, adm_p)
                     user, msg = db.authenticate(Session, username, password)
                     if user:
                         st.session_state.update(user_id=user.id, username=user.username,
@@ -409,6 +416,22 @@ def page_approvals():
                 st.rerun()
 
     st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+    members = [u for u in users if not u.is_admin]
+    if members:
+        with st.expander("Reset a member's password"):
+            with st.form("reset_pw", clear_on_submit=True):
+                who = st.selectbox("Member", members, format_func=lambda u: u.username)
+                p1 = st.text_input("New password", type="password", help="At least 8 characters")
+                p2 = st.text_input("Confirm new password", type="password")
+                go = st.form_submit_button("Set new password")
+            if go:
+                if len(p1) < 8:
+                    st.error("Password must be at least 8 characters.")
+                elif p1 != p2:
+                    st.error("Passwords don't match.")
+                elif db.set_password(Session, who.id, p1):
+                    st.success(f"Password updated for {who.username}. Give it to them directly.")
+
     st.subheader("Active users")
     st.dataframe(pd.DataFrame([{
         "Username": u.username, "Role": "Administrator" if u.is_admin else "Member",
